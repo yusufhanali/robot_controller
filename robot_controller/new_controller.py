@@ -1,6 +1,9 @@
 import rclpy
 import numpy as np
 
+from moveit.core.robot_state import RobotState
+from moveit.planning import MoveItPy
+
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
@@ -25,6 +28,8 @@ class NewController(Node):
         
         self.tfBuffer = Buffer()
         self.tfListener = TransformListener(self.tfBuffer, self)
+        
+        print("sanity")
         
         
     def publishVelocityCommand(self, vels):
@@ -59,6 +64,8 @@ class NewController(Node):
         
 def main(args=None):
     rclpy.init(args=args)
+    
+    
     new_controller = NewController()
     rclpy.spin(new_controller)    
     new_controller.destroy_node()
