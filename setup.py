@@ -22,6 +22,8 @@ setup(
         'console_scripts': [
             'controller = robot_controller.new_controller:main',
             'head_detector = robot_controller.head_detector:main',
+            'gaze_publisher = robot_controller.gaze_publisher:main',
+            'deneme = robot_controller.deneme:main',
         ],
     },
 )
