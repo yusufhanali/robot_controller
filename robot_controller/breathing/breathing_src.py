@@ -43,7 +43,6 @@ class Compensator():
         self.i += 1
         return command
 
-
 class Breather:
     
     def __init__(self, breathe_dict) -> None:
@@ -79,7 +78,7 @@ class Breather:
             self.num_of_joints = 3  # Body joints for UR
 
         if "compensation" in breathe_dict.keys():
-            self.compensation = False#breathe_dict["compensation"]
+            self.compensation = False #breathe_dict["compensation"]
         else:
             self.compensation = True
 
@@ -119,6 +118,10 @@ class Breather:
         velocity_command = np.dot(pinv_jacobian[:self.num_of_joints], velocity_task)
         
         return velocity_command
+    
+    def reset(self):
+        self.loop_index = 0
+        self.breathe_count = 0
     
     def step(self, joint_positions, joint_vels, jacobian_func):
         if self.compensation:

@@ -12,9 +12,9 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from jacobian.jacobian import get_jacobian    
+from .jacobian.jacobian_src import get_jacobian    
 
-import breathing.breathing as breathing
+from .breathing import breathing_src as breathing
 
 class GripperController:
     def __init__(self, host, port):
@@ -71,7 +71,7 @@ class NewController(Node):
         self.joint_state_sub = self.create_subscription(JointState, 'joint_states', self.joint_state_callback, 10)
         
         while not self.joint_states_global:
-            self.get_logger().info('Waiting for joint states...')
+            #self.get_logger().info('Waiting for joint states...')
             rclpy.spin_once(self)
         self.get_logger().info('Joint states received.')
         
@@ -81,7 +81,7 @@ class NewController(Node):
         self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
         
         while not self.velocityControllerPub.get_subscription_count():
-            self.get_logger().info('Waiting for velocity controller to connect...')
+            #self.get_logger().info('Waiting for velocity controller to connect...')
             rclpy.spin_once(self)
         self.get_logger().info('Velocity controller connected.')
 
@@ -91,7 +91,7 @@ class NewController(Node):
         self.tfListener = TransformListener(self.tfBuffer, self)
         
         while not self.tfBuffer.can_transform("base", "wrist_3_link", rclpy.time.Time()):
-            self.get_logger().info('Waiting for tf tree...')
+            #self.get_logger().info('Waiting for tf tree...')
             rclpy.spin_once(self)
         self.get_logger().info('TF tree received.')
 
@@ -126,8 +126,8 @@ class NewController(Node):
 
         # session_speed = exp_speed.Adaptive # deal with later
         
-        period, amplitude = 4, 1.0 #get_session_parameters(session_speed)
-        freq = 1 / period  # Named as beta in the paper
+        period, amplitude = 2, 0.5 #get_session_parameters(session_speed)
+        freq = 1.0 / period  # Named as beta in the paper
         self.breathe_dict["freq"] = freq
         self.breathe_dict["amplitude"] = amplitude
 
@@ -146,8 +146,8 @@ class NewController(Node):
         self.get_logger().info('Present day,')
         
         # Initialize control rate
-        self.control_rate = 500
-        self.ros_rate = self.create_rate(self.control_rate)
+        self.control_rate = 100
+        self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
         
         self.init_joint_states()
         
@@ -165,18 +165,15 @@ class NewController(Node):
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('present time.')  
       
-    def breathe_and_gaze(self, do_breathing=True, do_gazing=False):    
+    def breathe_and_gaze(self, do_breathing=True, do_gazing=False):   
+        
+        print("Starting breathe and gaze.") 
         
         self.gripper.close_async()
-        
-        global session_speed
-        global end_experiment
-        global state
                     
         self.breathe_controller.reset()    
             
-        while rclpy.ok():      
-                
+        while rclpy.ok():              
             breathing_velocities = np.zeros(self.num_of_breathing_joints)
             if do_breathing:
                 breathing_velocities = self.breathe_controller.step(self.joint_states_global["pos"],
@@ -262,10 +259,12 @@ class NewController(Node):
                 velocity_command = np.concatenate(([0]*3, gazing_velocities))
             else: 
                 velocity_command = np.concatenate((breathing_velocities[:3], gazing_velocities))
-                                                        
+                                           
             self.publishVelocityCommand(velocity_command)
-            
+                        
             self.ros_rate.sleep()
+                        
+        print("Exiting breathe and gaze.")
             
         self.stop_movement() 
         
@@ -273,7 +272,7 @@ class NewController(Node):
         
         self.timer.cancel()
         
-        self.gripper.close()
+        self.breathe_and_gaze()
         
     def stop_movement(self):
         self.publishVelocityCommand([0.0]*6)
@@ -285,6 +284,8 @@ class NewController(Node):
         return invj
         
     def publishVelocityCommand(self, vels):
+        if type(vels) is np.ndarray:
+            vels = vels.tolist()
         vel_msg = Float64MultiArray()
         vel_msg.data = vels
         self.velocityControllerPub.publish(vel_msg)
@@ -319,8 +320,10 @@ def main(args=None):
     try:
         rclpy.init(args=args)    
         new_controller = NewController()
-        rclpy.spin(new_controller)    
+        m_t_executor = rclpy.executors.MultiThreadedExecutor()
+        rclpy.spin(new_controller, executor=m_t_executor)
     except KeyboardInterrupt:
+        new_controller.stop_movement()
         print("\n take care of yourself \n")
         pass
     
