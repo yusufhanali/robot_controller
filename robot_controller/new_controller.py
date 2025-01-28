@@ -1,9 +1,10 @@
-from time import sleep
 import rclpy
+from rclpy.node import Node
+
 import numpy as np
 
-import rclpy.duration
-from rclpy.node import Node
+from .robotiq_gripper import RobotiqGripper as robotiq_gripper
+
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
@@ -12,6 +13,53 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 from .jacobian import get_jacobian    
+
+class GripperController:
+    def __init__(self, host, port):
+        self.host = host # The robot's computer address
+        self.port = port # The gripper's port number
+        self.gripper = None
+        self._init_gripper()
+
+    def _init_gripper(self):
+        print("Creating gripper...")
+        self.gripper = robotiq_gripper()
+        print("Connecting to gripper...")
+        self.gripper.connect(self.host, self.port)
+        print("Activating gripper...")
+        self.gripper.activate(auto_calibrate=False)
+        
+        self.close()
+
+    def open(self, speed=255, force=255):
+        self.gripper.move_and_wait_for_pos(0, speed, force)
+        # self.pub.publish(String("0.0"))
+
+    def close(self, speed=255, force=255):
+        self.gripper.move_and_wait_for_pos(255, speed, force)
+        # self.pub.publish(String("0.7"))
+
+    def close_async(self, speed=255, force=255):
+        self.gripper.move(255, speed, force)
+
+    def move_gripper(self, pos, speed=255, force=255):
+        pos = 0 if pos < 0 else (255 if pos > 255 else pos)
+        self.gripper.move_and_wait_for_pos(pos, speed, force)
+        
+    def current_pos(self):        
+        return self.gripper.get_current_position()
+    
+    def is_holding(self):
+        prev_pos = self.gripper.get_current_position()
+        if prev_pos < 50:
+            return False
+        #else:
+        #    print("WHY ARE WE HERE, JUST TO SUFFER?!")
+        self.gripper.move_and_wait_for_pos(prev_pos+1,255,255)
+        if (abs(self.gripper.get_current_position()-prev_pos)==0) and (self.gripper.get_current_position() < 100):
+            return True
+        else:
+            return False
 
 class NewController(Node):
 
@@ -22,23 +70,23 @@ class NewController(Node):
         
         self.joint_states_global = {}
         
-        self.velocityControllerTopic = "forward_velocity_controller/commands"
+        self.velocityControllerTopic = "forward_velocity_controller/commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
         self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
         
         self.tfBuffer = Buffer()
         self.tfListener = TransformListener(self.tfBuffer, self)
         
-        self.create_timer(1/1000, self.maain)
+        self.gripper = GripperController("192.168.1.102", 63352)
+        
+        self.timer = self.create_timer(1/1000, self.maain)
                         
         print("sanity")        
         
     def maain(self):
-        try:
-            vel = np.array([0, 0.01, 0, 0, 0, 0])
-            comm = self.get_inverse_jacobian() @ vel
-            self.publishVelocityCommand(comm)
-        except:
-            print("Error in main")
+        
+        self.timer.cancel()
+        
+        self.gripper.close()
                         
     def get_inverse_jacobian(self):
         jacobian = get_jacobian(self.joint_states_global["pos"][0], self.joint_states_global["pos"][1], self.joint_states_global["pos"][2], self.joint_states_global["pos"][3], self.joint_states_global["pos"][4], self.joint_states_global["pos"][5])
