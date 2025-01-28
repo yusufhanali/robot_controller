@@ -65,24 +65,33 @@ class NewController(Node):
 
     def __init__(self):
         super().__init__('new_controller')
-        self.get_logger().info('New Controller Node Started')
+        # Sanity check at the start of node (The phrases are very unprofessionally taken from my favorite anime, Serial Experiments Lain)
+        self.get_logger().info('Present day,')
+        
+        # Get joint states
+        self.joint_states_global = {}
         self.joint_state_sub = self.create_subscription(JointState, 'joint_states', self.joint_state_callback, 10)
         
-        self.joint_states_global = {}
-        
+        # Publish velocity commands
         self.velocityControllerTopic = "forward_velocity_controller/commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
         self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
         
+        # Get tf tree
         self.tfBuffer = Buffer()
         self.tfListener = TransformListener(self.tfBuffer, self)
         
-        self.gripper = GripperController("192.168.1.102", 63352)
+        # Initialize gripper
+        self.robot_ip = "192.168.1.102"
+        self.gripper_port = 63352
+        self.gripper = GripperController(self.robot_ip, self.gripper_port)
         
-        self.timer = self.create_timer(1/1000, self.maain)
+        # This is my easy emektar debugging and implementation method. (If you dont know what emektar is, please contact me at e2522100@ceng.metu.edu.tr I would be happy to explain / or look up a dictionary. The choice is, as it always is, yours.)
+        self.timer = self.create_timer(1/1000, self.emektar)
                         
-        print("sanity")        
+        # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
+        self.get_logger().info('present time.')  
         
-    def maain(self):
+    def emektar(self):
         
         self.timer.cancel()
         
