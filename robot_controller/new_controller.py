@@ -63,27 +63,63 @@ class GripperController:
 
 class NewController(Node):
 
+    def init_joint_states(self):
+        # Get joint states
+        self.joint_states_global = {}
+        self.joint_state_sub = self.create_subscription(JointState, 'joint_states', self.joint_state_callback, 10)
+        
+        while not self.joint_states_global:
+            self.get_logger().info('Waiting for joint states...')
+            rclpy.spin_once(self)
+        self.get_logger().info('Joint states received.')
+        
+    def init_velocity_controller(self):
+        # Publish velocity commands
+        self.velocityControllerTopic = "forward_velocity_controller/commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
+        self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
+        
+        while not self.velocityControllerPub.get_subscription_count():
+            self.get_logger().info('Waiting for velocity controller to connect...')
+            rclpy.spin_once(self)
+        self.get_logger().info('Velocity controller connected.')
+
+    def init_tf(self):
+        # Get tf tree
+        self.tfBuffer = Buffer()
+        self.tfListener = TransformListener(self.tfBuffer, self)
+        
+        while not self.tfBuffer.can_transform("base", "wrist_3_link", rclpy.time.Time()):
+            self.get_logger().info('Waiting for tf tree...')
+            rclpy.spin_once(self)
+        self.get_logger().info('TF tree received.')
+
+    def init_gripper(self):
+        # Initialize gripper
+        self.robot_ip = "192.168.1.102"
+        self.gripper_port = 63352
+        self.gripper = GripperController(self.robot_ip, self.gripper_port)
+        
+        self.gripper.open()
+        self.get_logger().info('Gripper opened.')
+        self.gripper.close()
+        self.get_logger().info('Gripper closed, gripper ready to go.')
+
     def __init__(self):
         super().__init__('new_controller')
         # Sanity check at the start of node (The phrases are very unprofessionally taken from my favorite anime, Serial Experiments Lain)
         self.get_logger().info('Present day,')
         
-        # Get joint states
-        self.joint_states_global = {}
-        self.joint_state_sub = self.create_subscription(JointState, 'joint_states', self.joint_state_callback, 10)
+        self.init_joint_states()
         
-        # Publish velocity commands
-        self.velocityControllerTopic = "forward_velocity_controller/commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
-        self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
+        self.init_velocity_controller()
         
-        # Get tf tree
-        self.tfBuffer = Buffer()
-        self.tfListener = TransformListener(self.tfBuffer, self)
+        self.init_tf()
         
-        # Initialize gripper
-        self.robot_ip = "192.168.1.102"
-        self.gripper_port = 63352
-        self.gripper = GripperController(self.robot_ip, self.gripper_port)
+        self.init_gripper()
+        
+        # Initialize control rate
+        self.control_rate = 500
+        self.ros_rate = self.create_rate(self.control_rate)
         
         # This is my easy emektar debugging and implementation method. (If you dont know what emektar is, please contact me at e2522100@ceng.metu.edu.tr I would be happy to explain / or look up a dictionary. The choice is, as it always is, yours.)
         self.timer = self.create_timer(1/1000, self.emektar)
@@ -98,6 +134,7 @@ class NewController(Node):
         self.gripper.close()
                         
     def get_inverse_jacobian(self):
+        # get_jacobian is a function that returns the jacobian matrix of the robot at the current joint states, it was calculated using matlab.
         jacobian = get_jacobian(self.joint_states_global["pos"][0], self.joint_states_global["pos"][1], self.joint_states_global["pos"][2], self.joint_states_global["pos"][3], self.joint_states_global["pos"][4], self.joint_states_global["pos"][5])
         invj = np.linalg.pinv(jacobian, rcond=1e-15)
         return invj
@@ -108,6 +145,7 @@ class NewController(Node):
         self.velocityControllerPub.publish(vel_msg)
         
     def joint_state_callback(self, msg):
+        # Why does UR5e always send joint states in an order other than 012345? It was 210345 in ROS1 and now this.
         self.joint_states_global["pos"] = np.array([
                                             msg.position[5],
                                             msg.position[0],
@@ -138,6 +176,8 @@ def main(args=None):
         new_controller = NewController()
         rclpy.spin(new_controller)    
     except KeyboardInterrupt:
+        print("\n take care of yourself \n")
         pass
+    
     new_controller.destroy_node()
-    rclpy.shutdown()
+    #rclpy.shutdown()
