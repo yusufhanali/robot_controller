@@ -1,7 +1,11 @@
 import rclpy
 from rclpy.node import Node
 
+import threading
+
 import numpy as np
+
+from scipy.spatial.transform import Rotation as R
 
 from .robotiq_gripper import RobotiqGripper as robotiq_gripper
 
@@ -15,6 +19,7 @@ from tf2_ros.transform_listener import TransformListener
 from .jacobian.jacobian_src import get_jacobian    
 
 from .breathing import breathing_src as breathing
+from .gazing import gazing_src as gazing
 
 class GripperController:
     def __init__(self, host, port):
@@ -126,7 +131,7 @@ class NewController(Node):
 
         # session_speed = exp_speed.Adaptive # deal with later
         
-        period, amplitude = 2, 0.5 #get_session_parameters(session_speed)
+        period, amplitude = 2, 1.2 #get_session_parameters(session_speed)
         freq = 1.0 / period  # Named as beta in the paper
         self.breathe_dict["freq"] = freq
         self.breathe_dict["amplitude"] = amplitude
@@ -140,14 +145,31 @@ class NewController(Node):
         self.breathe_dict["filter"] = True
         self.breathe_controller = breathing.Breather(self.breathe_dict)
 
+    def init_gazer(self):
+        # Set gazing parameters
+        # Change the kp, kd, ki values for better performance
+        self.gaze_dict = {}
+        self.gaze_dict["kp"] = 4.0
+        self.gaze_dict["kd"] = 0.0
+        self.gaze_dict["ki"] = 0.0
+        # Initial guesses are the initial joint values of the robot starting from the initial head joint
+        # In ur wrist_1, wrist_2, wrist_3 are the head joints
+        self.gaze_dict["initial_guesses"] = [-3.14, -1.57, -3.14]  # Decide accounting your robots initial joint values and gazing area
+
+        self.gazing_controller = gazing.Gazer(self.gaze_dict)
+
     def __init__(self):
         super().__init__('new_controller')
         # Sanity check at the start of node (The phrases are very unprofessionally taken from my favorite anime, Serial Experiments Lain)
         self.get_logger().info('Present day,')
         
         # Initialize control rate
-        self.control_rate = 100
+        self.control_rate = 500
         self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
+        
+        self.base = "base"
+        self.eef = "wrist_3_link"
+        self.world = "world"
         
         self.init_joint_states()
         
@@ -159,31 +181,45 @@ class NewController(Node):
         
         self.init_breather()
         
-        # This is my easy emektar debugging and implementation method. (If you dont know what emektar is, please contact me at e2522100@ceng.metu.edu.tr I would be happy to explain / or look up a dictionary. The choice is, as it always is, yours.)
-        self.timer = self.create_timer(1/1000, self.emektar)
-                        
+        self.init_gazer()
+                                
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('present time.')  
       
-    def breathe_and_gaze(self, do_breathing=True, do_gazing=False):   
+    def get_head_pose(self, use_helmet):    
+        try:
+            tf_name = "eye" if use_helmet else "exp/head"            
+            pose = self.tfBuffer.lookup_transform(self.world, tf_name, rclpy.time.Time())            
+            target_point = [pose.transform.translation.x, pose.transform.translation.y, pose.transform.translation.z]
+        except Exception as e:
+            target_point = None        
+        finally:
+            return target_point
+    
+    def breathe_and_gaze(self, do_breathing=True, do_gazing=True):   
         
         print("Starting breathe and gaze.") 
         
         self.gripper.close_async()
+        
+        self.gazing_breathing_compensation = False
+        self.use_helmet = False
                     
         self.breathe_controller.reset()    
             
         while rclpy.ok():              
+            
             breathing_velocities = np.zeros(self.num_of_breathing_joints)
             if do_breathing:
                 breathing_velocities = self.breathe_controller.step(self.joint_states_global["pos"],
                                                         self.joint_states_global["vels"],
                                                         get_jacobian)
-            """
+            
+            gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
             if do_gazing:
                 # Calculate head transformation matrix
                 # !!! Change "base_link" with "world" if the gazing is in the world frame !!!
-                transformation = tf_buffer.lookup_transform("base_link", "wrist_1_link", rospy.Time())            
+                transformation = self.tfBuffer.lookup_transform(self.world, "wrist_1_link", rclpy.time.Time())            
                 
                 r = R.from_quat(np.array([transformation.transform.rotation.x,
                                         transformation.transform.rotation.y,
@@ -196,39 +232,32 @@ class NewController(Node):
                                         transformation.transform.translation.z,
                                         1.0]]).T))
                 
-                if gazing_breathing_compensation and do_breathing:
+                if False and self.gazing_breathing_compensation and do_breathing:
                     # Compensate the gazing with breathing
                     lookahead_into_the_future = 0.27  # amt of time we look ahead into the future in seconds
-                    r_estimated = gazing_controller.get_head_position(joint_states_global["pos"][:4] + np.concatenate((breathing_velocities, [0])) * lookahead_into_the_future)
+                    r_estimated = self.gazing_controller.get_head_position(self.joint_states_global["pos"][:4] + np.concatenate((breathing_velocities, [0])) * lookahead_into_the_future)
                 else:
                     r_estimated = r
                 
                 # gazing_target = [0, 1, 0]  # !!! Change this wrt. the gazing target, gazing in base_link frame !!!
                 
-                if is_head_fake:            
-                    gazing_target = [fake_head_pos_x[index], fake_head_pos_y[index], fake_head_pos_z[index]]
-                    fake_pos = PointStamped()
-                    fake_pos.header.frame_id = world
-                    fake_pos.header.stamp = rospy.Time.now()
-                    fake_pos.point.x = gazing_target[0]
-                    fake_pos.point.y = gazing_target[1]
-                    fake_pos.point.z = gazing_target[2]
-                    fake_head_pos_publisher.publish(fake_pos)
-                else:
-                    gazing_target = get_head_pose(tf_buffer, use_helmet) 
+                gazing_target = self.get_head_pose(self.use_helmet) 
                         
-                gazing_velocities = gazing_controller.step(gazing_target, r_estimated, joint_states_global["pos"])
+                gazing_velocities = self.gazing_controller.step(gazing_target, r_estimated, self.joint_states_global["pos"])
                             
-                if gazing_target is not None and session_speed == exp_speed.Adaptive:
+                if gazing_target is not None:
+                    
                     distance_min, distance_max = 1.0 , 3.0
                     
                     distance = np.sqrt(gazing_target[0]**2 + gazing_target[1]**2 + gazing_target[2]**2)
+                    distance = max(min(distance, distance_max), distance_min)
                     
+                    """
                     frequency_min, frequency_max = 0.1, 0.8
                     mapping_frequency = lambda x: (frequency_max - frequency_min) * (x - distance_min) / (distance_max - distance_min) + frequency_min
                     new_freq = mapping_frequency(distance)
                     
-                    if abs(new_freq - breathe_controller.freq) > min_delta_freq:
+                    if abs(new_freq - self.breathe_controller.freq) > min_delta_freq:
                         if breathe_controller.filter:
                             breathe_controller.desired_freq = new_freq
                         else:
@@ -240,7 +269,7 @@ class NewController(Node):
                     
                     if abs(new_amplitude - breathe_controller.amplitude) > min_delta_amplitude:
                         breathe_controller.amplitude = new_amplitude
-                        
+                    
                     pid_min = (2.0, 0, 0)
                     pid_max = (4.0, 0, 0)
                     
@@ -248,20 +277,14 @@ class NewController(Node):
                     mapping_ki = lambda x: (pid_max[2] - pid_min[2]) * (x - distance_min) / (distance_max - distance_min) + pid_min[2]
                     
                     param = mapping_kp(distance), 0, mapping_ki(distance)
-                    gazing_controller.update_pid(param)    
-            """        
+                    self.gazing_controller.update_pid(param)   
+                    """
                     
             # Publish joint vels to robot
-            gazing_velocities = np.zeros(3)
-            if do_breathing and not do_gazing:
-                velocity_command = np.concatenate((breathing_velocities, [0]*(self.num_of_total_joints - self.num_of_breathing_joints)))
-            elif do_gazing and not do_breathing: 
-                velocity_command = np.concatenate(([0]*3, gazing_velocities))
-            else: 
-                velocity_command = np.concatenate((breathing_velocities[:3], gazing_velocities))
-                                           
+            velocity_command = np.concatenate((breathing_velocities, gazing_velocities))
+                                 
             self.publishVelocityCommand(velocity_command)
-                        
+                                                
             self.ros_rate.sleep()
                         
         print("Exiting breathe and gaze.")
@@ -320,8 +343,12 @@ def main(args=None):
     try:
         rclpy.init(args=args)    
         new_controller = NewController()
-        m_t_executor = rclpy.executors.MultiThreadedExecutor()
-        rclpy.spin(new_controller, executor=m_t_executor)
+        
+        controller_spin_thread = threading.Thread(target=rclpy.spin, args=(new_controller,), daemon=True)
+        controller_spin_thread.start()
+        
+        new_controller.breathe_and_gaze()
+        
     except KeyboardInterrupt:
         new_controller.stop_movement()
         print("\n take care of yourself \n")
