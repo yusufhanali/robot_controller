@@ -4,7 +4,13 @@ import numpy as np
 from numpy import sin, cos
 from numpy import arctan as atan
 
-def get_jacobian(theta1, theta2, theta3, theta4, theta5, theta6):
+def get_jacobian(joint_pos):
+    
+    theta1 = joint_pos[0]
+    theta2 = joint_pos[1]
+    theta3 = joint_pos[2]
+    theta4 = joint_pos[3]
+    theta5 = joint_pos[4]
     
     J = np.zeros((6,6))
     

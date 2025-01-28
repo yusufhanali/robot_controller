@@ -12,7 +12,9 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from .jacobian import get_jacobian    
+from jacobian.jacobian import get_jacobian    
+
+import breathing.breathing as breathing
 
 class GripperController:
     def __init__(self, host, port):
@@ -104,10 +106,48 @@ class NewController(Node):
         self.gripper.close()
         self.get_logger().info('Gripper closed, gripper ready to go.')
 
+    def init_breather(self):
+        # Set breathing parameters 
+        self.breathe_dict = {}
+        self.breathe_dict["control_rate"] = self.control_rate
+
+        # Set breathe vector direction in base frame
+        breathe_vec = np.array([0., 0., 1.])  # named as r in the paper
+        breathe_vec = breathe_vec / np.linalg.norm(breathe_vec) if np.all(breathe_vec > 0) else breathe_vec
+        self.breathe_dict["breathe_vec"] = breathe_vec
+
+        # Human breathing data based breathing velocity profile function f(·)
+        human_data_path = "/home/kovan/USTA/src/robot_controller/robot_controller/breathing/breathe_data.npy"
+        f = np.load(human_data_path)               
+        self.breathe_dict["f"] = f
+
+        # FAST: period = 2, amplitude = 1.2
+        # DEFAULT: period = 4, amplitude = 1.0
+
+        # session_speed = exp_speed.Adaptive # deal with later
+        
+        period, amplitude = 4, 1.0 #get_session_parameters(session_speed)
+        freq = 1 / period  # Named as beta in the paper
+        self.breathe_dict["freq"] = freq
+        self.breathe_dict["amplitude"] = amplitude
+
+        self.num_of_total_joints = 6  # UR5e has 6 joints
+        # Use at least 3 joints for breathing, below that, it is not effective
+        self.num_of_breathing_joints = 3  # Number of body joints starting from base towards to end effector
+        self.breathe_dict["num_of_joints"] = self.num_of_breathing_joints
+
+        self.breathe_dict["compensation"] = False
+        self.breathe_dict["filter"] = True
+        self.breathe_controller = breathing.Breather(self.breathe_dict)
+
     def __init__(self):
         super().__init__('new_controller')
         # Sanity check at the start of node (The phrases are very unprofessionally taken from my favorite anime, Serial Experiments Lain)
         self.get_logger().info('Present day,')
+        
+        # Initialize control rate
+        self.control_rate = 500
+        self.ros_rate = self.create_rate(self.control_rate)
         
         self.init_joint_states()
         
@@ -117,25 +157,130 @@ class NewController(Node):
         
         self.init_gripper()
         
-        # Initialize control rate
-        self.control_rate = 500
-        self.ros_rate = self.create_rate(self.control_rate)
+        self.init_breather()
         
         # This is my easy emektar debugging and implementation method. (If you dont know what emektar is, please contact me at e2522100@ceng.metu.edu.tr I would be happy to explain / or look up a dictionary. The choice is, as it always is, yours.)
         self.timer = self.create_timer(1/1000, self.emektar)
                         
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('present time.')  
+      
+    def breathe_and_gaze(self, do_breathing=True, do_gazing=False):    
+        
+        self.gripper.close_async()
+        
+        global session_speed
+        global end_experiment
+        global state
+                    
+        self.breathe_controller.reset()    
+            
+        while rclpy.ok():      
+                
+            breathing_velocities = np.zeros(self.num_of_breathing_joints)
+            if do_breathing:
+                breathing_velocities = self.breathe_controller.step(self.joint_states_global["pos"],
+                                                        self.joint_states_global["vels"],
+                                                        get_jacobian)
+            """
+            if do_gazing:
+                # Calculate head transformation matrix
+                # !!! Change "base_link" with "world" if the gazing is in the world frame !!!
+                transformation = tf_buffer.lookup_transform("base_link", "wrist_1_link", rospy.Time())            
+                
+                r = R.from_quat(np.array([transformation.transform.rotation.x,
+                                        transformation.transform.rotation.y,
+                                        transformation.transform.rotation.z,
+                                        transformation.transform.rotation.w]))
+                r = r.as_matrix()
+                r = np.vstack((r, [0,0,0]))
+                r = np.hstack((r, np.array([[transformation.transform.translation.x,
+                                        transformation.transform.translation.y,
+                                        transformation.transform.translation.z,
+                                        1.0]]).T))
+                
+                if gazing_breathing_compensation and do_breathing:
+                    # Compensate the gazing with breathing
+                    lookahead_into_the_future = 0.27  # amt of time we look ahead into the future in seconds
+                    r_estimated = gazing_controller.get_head_position(joint_states_global["pos"][:4] + np.concatenate((breathing_velocities, [0])) * lookahead_into_the_future)
+                else:
+                    r_estimated = r
+                
+                # gazing_target = [0, 1, 0]  # !!! Change this wrt. the gazing target, gazing in base_link frame !!!
+                
+                if is_head_fake:            
+                    gazing_target = [fake_head_pos_x[index], fake_head_pos_y[index], fake_head_pos_z[index]]
+                    fake_pos = PointStamped()
+                    fake_pos.header.frame_id = world
+                    fake_pos.header.stamp = rospy.Time.now()
+                    fake_pos.point.x = gazing_target[0]
+                    fake_pos.point.y = gazing_target[1]
+                    fake_pos.point.z = gazing_target[2]
+                    fake_head_pos_publisher.publish(fake_pos)
+                else:
+                    gazing_target = get_head_pose(tf_buffer, use_helmet) 
+                        
+                gazing_velocities = gazing_controller.step(gazing_target, r_estimated, joint_states_global["pos"])
+                            
+                if gazing_target is not None and session_speed == exp_speed.Adaptive:
+                    distance_min, distance_max = 1.0 , 3.0
+                    
+                    distance = np.sqrt(gazing_target[0]**2 + gazing_target[1]**2 + gazing_target[2]**2)
+                    
+                    frequency_min, frequency_max = 0.1, 0.8
+                    mapping_frequency = lambda x: (frequency_max - frequency_min) * (x - distance_min) / (distance_max - distance_min) + frequency_min
+                    new_freq = mapping_frequency(distance)
+                    
+                    if abs(new_freq - breathe_controller.freq) > min_delta_freq:
+                        if breathe_controller.filter:
+                            breathe_controller.desired_freq = new_freq
+                        else:
+                            breathe_controller.freq = new_freq   
+                        
+                    amplitude_min, amplitude_max = 0.6, 1.4
+                    mapping_amplitude = lambda x: (amplitude_max - amplitude_min) * (x - distance_min) / (distance_max - distance_min) + amplitude_min
+                    new_amplitude = mapping_amplitude(distance)
+                    
+                    if abs(new_amplitude - breathe_controller.amplitude) > min_delta_amplitude:
+                        breathe_controller.amplitude = new_amplitude
+                        
+                    pid_min = (2.0, 0, 0)
+                    pid_max = (4.0, 0, 0)
+                    
+                    mapping_kp = lambda x: (pid_max[0] - pid_min[0]) * (x - distance_min) / (distance_max - distance_min) + pid_min[0]
+                    mapping_ki = lambda x: (pid_max[2] - pid_min[2]) * (x - distance_min) / (distance_max - distance_min) + pid_min[2]
+                    
+                    param = mapping_kp(distance), 0, mapping_ki(distance)
+                    gazing_controller.update_pid(param)    
+            """        
+                    
+            # Publish joint vels to robot
+            gazing_velocities = np.zeros(3)
+            if do_breathing and not do_gazing:
+                velocity_command = np.concatenate((breathing_velocities, [0]*(self.num_of_total_joints - self.num_of_breathing_joints)))
+            elif do_gazing and not do_breathing: 
+                velocity_command = np.concatenate(([0]*3, gazing_velocities))
+            else: 
+                velocity_command = np.concatenate((breathing_velocities[:3], gazing_velocities))
+                                                        
+            self.publishVelocityCommand(velocity_command)
+            
+            self.ros_rate.sleep()
+            
+        self.stop_movement() 
         
     def emektar(self):
         
         self.timer.cancel()
         
         self.gripper.close()
+        
+    def stop_movement(self):
+        self.publishVelocityCommand([0.0]*6)
                         
     def get_inverse_jacobian(self):
         # get_jacobian is a function that returns the jacobian matrix of the robot at the current joint states, it was calculated using matlab.
-        jacobian = get_jacobian(self.joint_states_global["pos"][0], self.joint_states_global["pos"][1], self.joint_states_global["pos"][2], self.joint_states_global["pos"][3], self.joint_states_global["pos"][4], self.joint_states_global["pos"][5])
+        jacobian = get_jacobian(self.joint_states_global["pos"].tolist())
         invj = np.linalg.pinv(jacobian, rcond=1e-15)
         return invj
         
