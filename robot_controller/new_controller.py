@@ -7,6 +7,8 @@ import numpy as np
 
 from scipy.spatial.transform import Rotation as R
 
+import rclpy.time
+
 from .robotiq_gripper import RobotiqGripper as robotiq_gripper
 
 from sensor_msgs.msg import JointState
@@ -192,11 +194,43 @@ class NewController(Node):
             pose = self.tfBuffer.lookup_transform(self.world, tf_name, rclpy.time.Time())            
             target_point = [pose.transform.translation.x, pose.transform.translation.y, pose.transform.translation.z]
         except Exception as e:
+            print("Error in get_head_pose: ", e)
             target_point = None        
         finally:
             return target_point
     
-    def breathe_and_gaze(self, do_breathing=True, do_gazing=True):   
+    def get_gaze_velocities(self):
+        
+        tf_name = "eye" if self.use_helmet else "exp/head"
+        tf_name = "eye"
+                    
+        gaze_multiplier = 3
+        
+        cw1 = 0
+        cw2 = 0                
+        
+        gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+        try:
+            head_in_w1 = self.tfBuffer.lookup_transform("wrist_1_link", tf_name, rclpy.time.Time(seconds=0))
+            head_in_w1_pos = np.array([head_in_w1.transform.translation.x, head_in_w1.transform.translation.y, 0])
+            head_in_w1_norm = np.linalg.norm(head_in_w1_pos)
+            cw1 = np.arccos(0.0997 / head_in_w1_norm) - np.arccos(np.dot([0,-1,0], head_in_w1_pos/head_in_w1_norm))
+            gazing_velocities[0] = cw1*gaze_multiplier
+            
+            head_in_w2 = self.tfBuffer.lookup_transform("wrist_2_link", tf_name, rclpy.time.Time(seconds=0))
+            head_in_w2_pos = np.array([head_in_w2.transform.translation.x, head_in_w2.transform.translation.y, 0])
+            head_in_w2_norm = np.linalg.norm(head_in_w2_pos)
+            cw2 = np.arccos(np.dot([0,1,0], head_in_w2_pos/head_in_w2_norm))
+            cw2 = cw2*(-1) if head_in_w2_pos[0] > 0 else cw2
+            gazing_velocities[1] = cw2*gaze_multiplier
+        except TransformException as e:
+            gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+            print("Error in getting head position: ", e)
+            
+        return gazing_velocities
+        
+    
+    def breathe_and_gaze(self, do_breathing=False, do_gazing=True):   
         
         print("Starting breathe and gaze.") 
         
@@ -217,6 +251,10 @@ class NewController(Node):
             
             gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
             if do_gazing:
+                
+                gazing_velocities = self.get_gaze_velocities()                
+                
+                """
                 # Calculate head transformation matrix
                 # !!! Change "base_link" with "world" if the gazing is in the world frame !!!
                 transformation = self.tfBuffer.lookup_transform(self.world, "wrist_1_link", rclpy.time.Time())            
@@ -252,7 +290,7 @@ class NewController(Node):
                     distance = np.sqrt(gazing_target[0]**2 + gazing_target[1]**2 + gazing_target[2]**2)
                     distance = max(min(distance, distance_max), distance_min)
                     
-                    """
+                    
                     frequency_min, frequency_max = 0.1, 0.8
                     mapping_frequency = lambda x: (frequency_max - frequency_min) * (x - distance_min) / (distance_max - distance_min) + frequency_min
                     new_freq = mapping_frequency(distance)
