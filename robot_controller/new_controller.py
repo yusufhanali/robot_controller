@@ -208,15 +208,15 @@ class NewController(Node):
         cw1 = 0
         cw2 = 0                
         
-        jacobian = self.get_jacobian_matrix()
+        """jacobian = self.get_jacobian_matrix()
         
         instant_velocities = jacobian @ self.joint_states_global["vels"]
-        delta = instant_velocities[:3] / 2
+        delta = instant_velocities[:3] / 2"""
         
         gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
         try:
             
-            base_to_w1 = self.tfBuffer.lookup_transform("wrist_1_link", "base", rclpy.time.Time(seconds=0))
+            """base_to_w1 = self.tfBuffer.lookup_transform("wrist_1_link", "base", rclpy.time.Time(seconds=0))
             delta_in_w1 = R.from_quat([base_to_w1.transform.rotation.x,
                                        base_to_w1.transform.rotation.y,
                                        base_to_w1.transform.rotation.z,
@@ -226,17 +226,17 @@ class NewController(Node):
             delta_in_w2 = R.from_quat([base_to_w2.transform.rotation.x,
                                         base_to_w2.transform.rotation.y,
                                         base_to_w2.transform.rotation.z,
-                                        base_to_w2.transform.rotation.w]).apply(delta)
+                                        base_to_w2.transform.rotation.w]).apply(delta)"""
                         
             head_in_w1 = self.tfBuffer.lookup_transform("wrist_1_link", tf_name, rclpy.time.Time(seconds=0))
-            head_in_w1_pos = np.array([head_in_w1.transform.translation.x-delta_in_w1[0], head_in_w1.transform.translation.y-delta_in_w1[1], 0])
+            head_in_w1_pos = np.array([head_in_w1.transform.translation.x, head_in_w1.transform.translation.y, 0])
             head_in_w1_norm = np.linalg.norm(head_in_w1_pos)
             cw1 = np.arccos(0.0997 / head_in_w1_norm) - np.arccos(np.dot([0,-1,0], head_in_w1_pos/head_in_w1_norm))
-            cw1 = cw1 - np.pi/2 if cw1 > np.pi/2 else cw1 
+            cw1 = cw1*(-1) if head_in_w1_pos[0] > 0 else cw1
             gazing_velocities[0] = cw1*gaze_multiplier
             
             head_in_w2 = self.tfBuffer.lookup_transform("wrist_2_link", tf_name, rclpy.time.Time(seconds=0))
-            head_in_w2_pos = np.array([head_in_w2.transform.translation.x-delta_in_w2[0], head_in_w2.transform.translation.y-delta_in_w2[1], 0])
+            head_in_w2_pos = np.array([head_in_w2.transform.translation.x, head_in_w2.transform.translation.y, 0])
             head_in_w2_norm = np.linalg.norm(head_in_w2_pos)
             cw2 = np.arccos(np.dot([0,1,0], head_in_w2_pos/head_in_w2_norm))
             cw2 = cw2*(-1) if head_in_w2_pos[0] > 0 else cw2
@@ -248,7 +248,7 @@ class NewController(Node):
         return gazing_velocities
         
     
-    def breathe_and_gaze(self, do_breathing=True, do_gazing=True):   
+    def breathe_and_gaze(self, do_breathing=True, do_gazing=False):   
         
         print("Starting breathe and gaze.") 
         
