@@ -192,9 +192,12 @@ class GazeViz(Node):
             quat = [camera_transform.transform.rotation.x, camera_transform.transform.rotation.y, camera_transform.transform.rotation.z, camera_transform.transform.rotation.w]
             Rot = R.from_quat(quat)
             gaze_direction = Rot.apply(gaze_direction)
-                                    
+            # IMPORTANT: without the two following print comments, code does not work. I don't know why.
+            print("gaze viz gaze_callback before compute_gaze_target, gaze_direction: ", gaze_direction)# for debug
+
             gaze_success, gaze_target = compute_gaze_target(gaze_direction, gaze_tail, self.table_points)
-                        
+            print("gaze viz gaze_callback , gaze_target: ", gaze_target)# for debug
+
             if gaze_target is not None:            
                 gaze_marker = Marker()
                 gaze_marker.header.frame_id = "world"
@@ -255,9 +258,11 @@ class GazeViz(Node):
                         
         except:
             self.get_logger().info("Error in gaze callback")
-        
+     
+def test_compute_gaze_target():
+    found, target = compute_gaze_target([-1, -1, -1], [1, 1, 1], [[2, 3, 0], [-2, 3, 0], [2, -3, 0], [-2, -3, 0]])
+    print("found, target: ,", found, target)
 def main(args=None):
-
     try:
         rclpy.init(args=args)    
         gazeviz = GazeViz()
