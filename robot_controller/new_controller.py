@@ -27,8 +27,9 @@ from .jacobian.jacobian_src import get_jacobian
 from .breathing import breathing_src as breathing
 
 
-data = []
-
+error_x = []
+error_y = []
+breathe = []
 
 class GripperController:
     def __init__(self, host, port):
@@ -140,8 +141,8 @@ class NewController(Node):
 
         # session_speed = exp_speed.Adaptive # deal with later
         
-        period, amplitude = 2, 1.5 #get_session_parameters(session_speed)
-        freq = 1.0 / period  # Named as beta in the paper
+        self.breathe_period, amplitude = 2, 1.4 #get_session_parameters(session_speed)
+        freq = 1.0 / self.breathe_period  # Named as beta in the paper
         self.breathe_dict["freq"] = freq
         self.breathe_dict["amplitude"] = amplitude
 
@@ -160,7 +161,7 @@ class NewController(Node):
         self.get_logger().info('Present day,')
         
         # Initialize control rate
-        self.control_rate = 500  # Hz
+        self.control_rate =500  # Hz
         self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
         
         self.base = "base"
@@ -187,7 +188,7 @@ class NewController(Node):
     
     def get_gaze_velocities(self, breathing_velocities):
         
-        tf_name = "eye" if self.use_helmet else "exp/head"
+        tf_name = "eye"
                     
         gaze_multiplier = 3
         
@@ -198,7 +199,7 @@ class NewController(Node):
         
         vels = np.concatenate((breathing_velocities, self.joint_states_global["vels"][self.num_of_breathing_joints:]))
         instant_velocities = jacobian @ vels
-        delta = instant_velocities[:3] * 2
+        delta = instant_velocities[:3] * self.breathe_period
         
         gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
         try:
@@ -249,7 +250,8 @@ class NewController(Node):
             
             breathing_velocities = np.zeros(self.num_of_breathing_joints)
             if do_breathing:
-                breathing_velocities = self.breathe_controller.step(self.joint_states_global["pos"], self.joint_states_global["vels"], get_jacobian)
+                breathing_velocities, mag = self.breathe_controller.step(self.joint_states_global["pos"], self.joint_states_global["vels"], get_jacobian)
+                breathe.append(mag)
             
             gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
             if do_gazing:
@@ -315,7 +317,13 @@ class NewController(Node):
             vels = np.array(vels)
          
         vels = self.filter_joint_velocities(vels)            
-        data.append(vels)
+        
+        try:
+            tf = self.tfBuffer.lookup_transform("wrist_3_link", "eye", rclpy.time.Time())
+            error_x.append(tf.transform.translation.x)
+            error_y.append(tf.transform.translation.y)
+        except TransformException as e:
+            print("Error in getting head position: ", e)
             
         vel_msg = Float64MultiArray()
         vel_msg.data = vels
@@ -371,21 +379,10 @@ def main(args=None):
         print("\n take care of yourself \n")
         pass
     
-    j1 = [x for x in np.array(data)[:,0]]
-    j2 = [x for x in np.array(data)[:,1]]
-    j3 = [x for x in np.array(data)[:,2]]
-    j4 = [x for x in np.array(data)[:,3]]
-    j5 = [x for x in np.array(data)[:,4]]
-    j6 = [x for x in np.array(data)[:,5]]
-    
-    plt.plot(j1, label="Joint 1")
-    plt.plot(j2, label="Joint 2")
-    plt.plot(j3, label="Joint 3")
-    plt.plot(j4, label="Joint 4")
-    plt.plot(j5, label="Joint 5")
-    plt.plot(j6, label="Joint 6")
-    plt.legend()
-    plt.show()
+    np.save("/home/kovan/USTA/src/robot_controller/robot_controller/data/breathe.npy", breathe)
+    np.save("/home/kovan/USTA/src/robot_controller/robot_controller/data/error_x.npy", error_x[:-1])
+    np.save("/home/kovan/USTA/src/robot_controller/robot_controller/data/error_y.npy", error_y[:-1])
+    print(len(breathe), len(error_x[:-1]), len(error_y[:-1]))
     
     new_controller.destroy_node()
     #rclpy.shutdown()

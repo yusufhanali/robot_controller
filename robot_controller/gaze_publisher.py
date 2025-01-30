@@ -1,5 +1,4 @@
 import rclpy
-import numpy as np
 
 import socket
 import os
@@ -7,7 +6,7 @@ import os
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 
-SOCKET_FILE = '/tmp/usta_sockets/gaze.sock'
+SOCKET_FILE = '/tmp/usta_sockets_gaze.sock'
 
 class GazePublisher(Node):
 

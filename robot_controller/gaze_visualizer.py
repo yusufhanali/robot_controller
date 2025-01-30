@@ -8,13 +8,12 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from .util import order_points_counter_clockwise
 
-from visualization_msgs.msg import Marker   
+from visualization_msgs.msg import MarkerArray, Marker
+from geometry_msgs.msg import Point
 
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-
-TABLE_POINTS = np.array([ [0.69, 0.97, 0.72], [0.03, -0.63, 0.72], [0.00, 0.96, 0.72], [0.72, -0.61, 0.72] ])
 
 def compute_gaze_target(gd, gt, table_points):
     """
@@ -83,7 +82,7 @@ def compute_gaze_target(gd, gt, table_points):
         first_cross = None
         
         for i in range(len(table_points) - 1):
-            cross = np.cross(table_points[i+1] - table_points[i], table_center - table_points[i+1])
+            cross = np.cross(table_points[i+1] - table_points[i], tar - table_points[i+1])
             
             if first_cross is None:
                 first_cross = cross
@@ -91,13 +90,24 @@ def compute_gaze_target(gd, gt, table_points):
                 # if the cross product is ever in the opposite direction of the first cross product, return False since that implies the point is outside the table.
                 #Note: the cross product can be either in the exacy same direction or in the exact opposite direction, never in between.
                 if np.dot(first_cross, cross) < 0:
-                    return False, None
+                    return False, tar
 
         return True, tar
 
     except ValueError:
         # No valid intersection found
         return False, None
+
+def get_table_points(table_pos, table_rot, x_width, z_breadth):
+    
+    table_points = []
+    
+    table_points.append(table_rot.apply([x_width, 0, z_breadth]) + table_pos)
+    table_points.append(table_rot.apply([-x_width, 0, z_breadth]) + table_pos)
+    table_points.append(table_rot.apply([-x_width, 0, -z_breadth]) + table_pos)
+    table_points.append(table_rot.apply([x_width, 0, -z_breadth]) + table_pos)
+    
+    return np.array(table_points)
 
 class GazeViz(Node):
 
@@ -108,29 +118,84 @@ class GazeViz(Node):
         self.gaze_vector_topic = "gaze_vector"
         self.subscriber = self.create_subscription(Float64MultiArray, self.gaze_vector_topic, self.gaze_callback, 10)
         
-        self.gaze_pub = self.create_publisher(Marker, 'visualization_marker', 10)
+        self.table_points = None
+        
+        self.gaze_target_pub = self.create_publisher(Float64MultiArray, 'gaze_target', 10)
+        self.gaze_pub = self.create_publisher(MarkerArray, 'gaze_marker_topic', 10)
+        self.table_pub = self.create_publisher(MarkerArray, 'table_marker_topic', 10)
+        self.table_timer = self.create_timer(0.01, self.table_callback)
         
         self.tfBuffer = Buffer()
         self.tfListener = TransformListener(self.tfBuffer, self)
         
-    def gaze_callback(self, msg):
+        while not self.tfBuffer.can_transform("base", "wrist_3_link", rclpy.time.Time()):
+            #self.get_logger().info('Waiting for tf tree...')
+            rclpy.spin_once(self)
+        self.get_logger().info('TF tree received.')
+    
+        
+    def table_callback(self):
         
         try:
+            markers = MarkerArray()
+                
+            #TABLE 160*70 height-72 z-80 x-35 
+                            
+            table_transform = self.tfBuffer.lookup_transform("world", "rigid_body_3", rclpy.time.Time())
+            r = R.from_quat([table_transform.transform.rotation.x, table_transform.transform.rotation.y, table_transform.transform.rotation.z, table_transform.transform.rotation.w])
+            table_pos = np.array([table_transform.transform.translation.x, table_transform.transform.translation.y, table_transform.transform.translation.z])
+            self.table_points = get_table_points(table_pos, r, 0.35, 0.8)
+                            
+            table_pt = Marker()
+            table_pt.header.frame_id = "world"
+            table_pt.header.stamp = self.get_clock().now().to_msg()
+            table_pt.id = 0
+            table_pt.type = Marker.CUBE
+            table_pt.action = Marker.ADD
+            table_pt.pose.position.x = table_pos[0]
+            table_pt.pose.position.y = table_pos[1]
+            table_pt.pose.position.z = table_pos[2]
+            table_pt.scale.x = 0.7
+            table_pt.scale.y = 0.001
+            table_pt.scale.z = 1.6
+            table_pt.color.a = 1.0
+            table_pt.color.r = 1.0
+            table_pt.color.g = 1.0
+            table_pt.color.b = 0.0
+            table_pt.pose.orientation.w = table_transform.transform.rotation.w
+            table_pt.pose.orientation.x = table_transform.transform.rotation.x
+            table_pt.pose.orientation.y = table_transform.transform.rotation.y
+            table_pt.pose.orientation.z = table_transform.transform.rotation.z
+            
+            markers.markers.append(table_pt)            
+            
+            self.table_pub.publish(markers)
+        except:
+            self.get_logger().info("Error in table callback")
+        
+    def gaze_callback(self, msg):
+        
+        use_helmet = True
+        gaze_markers = MarkerArray()
+        
+        try:                        
+            head_frame = "eye" if use_helmet else "exp/head"
                         
-            eye_transform = self.tfBuffer.lookup_transform("world", "eye", rclpy.time.Time())
+            eye_transform = self.tfBuffer.lookup_transform("world", head_frame, rclpy.time.Time())
             gaze_tail = np.array([eye_transform.transform.translation.x, eye_transform.transform.translation.y, eye_transform.transform.translation.z])
                         
             msg_data = msg.data
             gaze_direction = np.array(msg_data)
+            gaze_direction = gaze_direction / np.linalg.norm(gaze_direction)
                         
             camera_transform = self.tfBuffer.lookup_transform("world", "camera_link", rclpy.time.Time())
             quat = [camera_transform.transform.rotation.x, camera_transform.transform.rotation.y, camera_transform.transform.rotation.z, camera_transform.transform.rotation.w]
             Rot = R.from_quat(quat)
             gaze_direction = Rot.apply(gaze_direction)
                                     
-            gaze_success, gaze_target = compute_gaze_target(gaze_direction, gaze_tail, TABLE_POINTS)
+            gaze_success, gaze_target = compute_gaze_target(gaze_direction, gaze_tail, self.table_points)
                         
-            if gaze_success:            
+            if gaze_target is not None:            
                 gaze_marker = Marker()
                 gaze_marker.header.frame_id = "world"
                 gaze_marker.header.stamp = self.get_clock().now().to_msg()
@@ -152,7 +217,41 @@ class GazeViz(Node):
                 gaze_marker.pose.orientation.y = 0.0
                 gaze_marker.pose.orientation.z = 0.0
                 
-                self.gaze_pub.publish(gaze_marker)
+                gaze_markers.markers.append(gaze_marker)
+                
+                gaze_arrow = Marker()
+                gaze_arrow.header.frame_id = "world"
+                gaze_arrow.header.stamp = self.get_clock().now().to_msg()
+                gaze_arrow.id = 1
+                gaze_arrow.type = Marker.ARROW
+                gaze_arrow.action = Marker.ADD
+                tail_point = Point()
+                tail_point.x = gaze_tail[0]
+                tail_point.y = gaze_tail[1]
+                tail_point.z = gaze_tail[2]
+                end_ = gaze_tail + gaze_direction
+                end_point = Point()
+                end_point.x = end_[0]
+                end_point.y = end_[1]
+                end_point.z = end_[2]
+                gaze_arrow.points.append(tail_point)
+                gaze_arrow.points.append(end_point)
+                gaze_arrow.scale.x = 0.01
+                gaze_arrow.scale.y = 0.02
+                gaze_arrow.scale.z = 0.0
+                gaze_arrow.color.a = 1.0
+                gaze_arrow.color.r = 1.0
+                gaze_arrow.color.g = 0.0
+                gaze_arrow.color.b = 0.0
+                gaze_arrow.pose.orientation.w = 1.0
+                gaze_arrow.pose.orientation.x = 0.0
+                gaze_arrow.pose.orientation.y = 0.0
+                gaze_arrow.pose.orientation.z = 0.0
+                
+                gaze_markers.markers.append(gaze_arrow)
+                                
+            self.gaze_pub.publish(gaze_markers)
+            self.gaze_target_pub.publish(Float64MultiArray(data=gaze_target))
                         
         except:
             self.get_logger().info("Error in gaze callback")
