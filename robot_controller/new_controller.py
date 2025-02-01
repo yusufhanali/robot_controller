@@ -4,6 +4,7 @@ import rclpy.executors
 from rclpy.node import Node
 
 import threading
+import time
 
 import numpy as np
 
@@ -26,10 +27,6 @@ from .jacobian.jacobian_src import get_jacobian
 
 from .breathing import breathing_src as breathing
 
-
-error_x = []
-error_y = []
-breathe = []
 
 class GripperController:
     def __init__(self, host, port):
@@ -182,6 +179,8 @@ class NewController(Node):
         
         self.prev_velocities = np.zeros(6)
         self.prev_accelerations = np.zeros(6)
+        
+        self.home_pos = np.array([-0.8, -1.73, -2.1,  0.73,  1.52,  3.16])
                                         
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('present time.')  
@@ -200,6 +199,7 @@ class NewController(Node):
         vels = np.concatenate((breathing_velocities, self.joint_states_global["vels"][self.num_of_breathing_joints:]))
         instant_velocities = jacobian @ vels
         delta = instant_velocities[:3] * self.breathe_period
+        #delta *= 0 # Comment this line to enable gazing
         
         gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
         try:
@@ -217,14 +217,14 @@ class NewController(Node):
                                         base_to_w2.transform.rotation.w]).apply(delta)
                         
             head_in_w1 = self.tfBuffer.lookup_transform("wrist_1_link", tf_name, rclpy.time.Time(seconds=0))
-            head_in_w1_pos = np.array([head_in_w1.transform.translation.x-delta_in_w1[0], head_in_w1.transform.translation.y-delta_in_w1[1], 0])
+            head_in_w1_pos = np.array([head_in_w1.transform.translation.x, head_in_w1.transform.translation.y-delta_in_w1[1], 0])
             head_in_w1_norm = np.linalg.norm(head_in_w1_pos)
             cw1 = np.arccos(0.0997 / head_in_w1_norm) - np.arccos(np.dot([0,-1,0], head_in_w1_pos/head_in_w1_norm))
             cw1 = cw1*(-1) if head_in_w1_pos[0] > 0 else cw1
             gazing_velocities[0] = cw1*gaze_multiplier
             
             head_in_w2 = self.tfBuffer.lookup_transform("wrist_2_link", tf_name, rclpy.time.Time(seconds=0))
-            head_in_w2_pos = np.array([head_in_w2.transform.translation.x-delta_in_w2[0], head_in_w2.transform.translation.y-delta_in_w2[1], 0])
+            head_in_w2_pos = np.array([head_in_w2.transform.translation.x, head_in_w2.transform.translation.y-delta_in_w2[1], 0])
             head_in_w2_norm = np.linalg.norm(head_in_w2_pos)
             cw2 = np.arccos(np.dot([0,1,0], head_in_w2_pos/head_in_w2_norm))
             cw2 = cw2*(-1) if head_in_w2_pos[0] > 0 else cw2
@@ -251,11 +251,9 @@ class NewController(Node):
             breathing_velocities = np.zeros(self.num_of_breathing_joints)
             if do_breathing:
                 breathing_velocities, mag = self.breathe_controller.step(self.joint_states_global["pos"], self.joint_states_global["vels"], get_jacobian)
-                breathe.append(mag)
             
             gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
-            if do_gazing:
-                
+            if do_gazing:                
                 gazing_velocities = self.get_gaze_velocities(breathing_velocities)                
                     
             # Publish joint vels to robot
@@ -268,9 +266,36 @@ class NewController(Node):
         print("Exiting breathe and gaze.")
             
         self.stop_movement() 
+     
+    def go_to_joint_pos(self, desired_joint_positions, speed=0.05):
+        
+        trajectory = desired_joint_positions - self.joint_states_global["pos"]      
+        norm = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])        
+        delta_t = norm/speed
+                
+        velocity_command = trajectory / delta_t
+        print("desired_joint_positions: ", desired_joint_positions)
+        print("velocity_command: ", velocity_command)
+            
+        self.publishVelocityCommand(velocity_command)
+        
+        start_time = time.time()
+        
+        while norm > 0.001 and time.time() - start_time < delta_t + 0.1:
+            norm = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])
+            
+        self.stop_movement() 
+        
+        print("Position reached, current position: ", self.joint_states_global["pos"])  
+       
+    def go_to_home_pos(self):
+        self.go_to_joint_pos(self.home_pos)
         
     def stop_movement(self):
-        self.publishVelocityCommand([0.0]*6)
+        vel_msg = Float64MultiArray()
+        vel_msg.data = np.array([0, 0, 0, 0, 0, 0])
+        self.velocityControllerPub.publish(vel_msg)
+        print("Movement stopped.")
           
     def get_jacobian_matrix(self):
         # get_jacobian is a function that returns the jacobian matrix of the robot at the current joint states, it was calculated using matlab.
@@ -317,13 +342,6 @@ class NewController(Node):
             vels = np.array(vels)
          
         vels = self.filter_joint_velocities(vels)            
-        
-        try:
-            tf = self.tfBuffer.lookup_transform("wrist_3_link", "eye", rclpy.time.Time())
-            error_x.append(tf.transform.translation.x)
-            error_y.append(tf.transform.translation.y)
-        except TransformException as e:
-            print("Error in getting head position: ", e)
             
         vel_msg = Float64MultiArray()
         vel_msg.data = vels
@@ -370,19 +388,20 @@ def main(args=None):
         controller_spin_thread = threading.Thread(target=spin_thread, args=(new_controller,), daemon=True)
         controller_spin_thread.start()
         
+        new_controller.go_to_home_pos()
         new_controller.breathe_and_gaze()
-        
-    except KeyboardInterrupt:
-            
-        controller_spin_thread.join()
-                
-        print("\n take care of yourself \n")
+    except:       
         pass
     
-    np.save("/home/kovan/USTA/src/robot_controller/robot_controller/data/breathe.npy", breathe)
-    np.save("/home/kovan/USTA/src/robot_controller/robot_controller/data/error_x.npy", error_x[:-1])
-    np.save("/home/kovan/USTA/src/robot_controller/robot_controller/data/error_y.npy", error_y[:-1])
-    print(len(breathe), len(error_x[:-1]), len(error_y[:-1]))
+    try:
+        new_controller.stop_movement()
+        
+        new_controller.destroy_node()
+        rclpy.shutdown()
+    except:
+        pass
     
-    new_controller.destroy_node()
-    #rclpy.shutdown()
+    controller_spin_thread.join()
+    
+    print("\n take care of yourself \n")
+    
