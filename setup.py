@@ -24,6 +24,7 @@ setup(
             'head_detector = robot_controller.head_detector:main',
             'gaze_publisher = robot_controller.gaze_publisher:main',
             'gaze_visualizer = robot_controller.gaze_visualizer:main',
+            'gaze_test_data_collecter = robot_controller.gaze_test_data_collecter:main',
         ],
     },
 )

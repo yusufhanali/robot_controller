@@ -1,8 +1,9 @@
+#this file is for demonstration purposes only, it is not used in USTA setup
 import socket
 import os
 
 # Define the socket file
-SOCKET_FILE = '/tmp/usta_sockets/gaze.sock'
+SOCKET_FILE = '/tmp/usta_sockets_gaze.sock'
 
 # Ensure the socket file does not already exist
 if os.path.exists(SOCKET_FILE):

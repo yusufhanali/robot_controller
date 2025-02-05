@@ -117,7 +117,7 @@ class Breather:
         # Task space --> Configuration space 
         velocity_command = np.dot(pinv_jacobian[:self.num_of_joints], velocity_task)
         
-        return velocity_command
+        return velocity_command, velocity_magnitude
     
     def reset(self):
         self.loop_index = 0
@@ -144,7 +144,7 @@ class Breather:
                 velocity_command = self.step_breathe(joint_positions, jacobian_func)
         
         else:
-            velocity_command = self.step_breathe(joint_positions, jacobian_func)
+            velocity_command, velocity_magnitude = self.step_breathe(joint_positions, jacobian_func)
 
         self.loop_index = self.loop_index + 1 
         self.loop_index = self.loop_index % int(self.control_rate / self.freq)
@@ -152,4 +152,4 @@ class Breather:
             self.breathe_count += 1
             # print(f"Breathe count: {self.breathe_count}")
 
-        return velocity_command
+        return velocity_command, velocity_magnitude
