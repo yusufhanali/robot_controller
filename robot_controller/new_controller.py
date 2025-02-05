@@ -23,10 +23,24 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
-from .jacobian.jacobian_src import get_jacobian    
+from .jacobian.jacobian_src import get_jacobian, get_ee_position
 
 from .breathing import breathing_src as breathing
 
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+
+from enum import Enum
+
+class RobotState(Enum):
+    START = 0
+    PICKING = 1
+    PLACING = 2
+    BREATHING_GAZING = 3
+    END = 4
+
+data = []
+data_c = []
 
 class GripperController:
     def __init__(self, host, port):
@@ -133,6 +147,33 @@ def make_parabola(start_pos, mid_pos, end_pos, amt_points=100):
     
     return traj_points
 
+def three_point_cubic_spline(start_pos, mid_pos, end_pos):
+    p0 = start_pos
+    p1 = end_pos    
+    r0 = (mid_pos - start_pos) / np.linalg.norm(mid_pos - start_pos)
+    r1 = (end_pos - mid_pos) / np.linalg.norm(end_pos - mid_pos)
+    
+    p0x, p0y, p0z = p0[0], p0[1], p0[2]
+    p1x, p1y, p1z = p1[0], p1[1], p1[2]
+    r0x, r0y, r0z = r0[0], r0[1], r0[2]
+    r1x, r1y, r1z = r1[0], r1[1], r1[2]
+    
+    x_constraints = np.array([p0x, p1x, r0x, r1x])
+    y_constraints = np.array([p0y, p1y, r0y, r1y])
+    z_constraints = np.array([p0z, p1z, r0z, r1z])
+    
+    cubic_spline_inverse_matrix = np.array([[2, -2, 1, 1],
+                                            [-3, 3, -2, -1],
+                                            [0, 0, 1, 0],
+                                            [1, 0, 0, 0]])
+
+    
+    x_coefficients = cubic_spline_inverse_matrix @ x_constraints
+    y_coefficients = cubic_spline_inverse_matrix @ y_constraints
+    z_coefficients = cubic_spline_inverse_matrix @ z_constraints
+    
+    return x_coefficients, y_coefficients, z_coefficients
+
 class NewController(Node):
 
     def init_joint_states(self):
@@ -216,7 +257,7 @@ class NewController(Node):
         self.get_logger().info('Present day,')
         
         # Initialize control rate
-        self.control_rate =500  # Hz
+        self.control_rate = 500  # Hz
         self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
         
         self.base = "base"
@@ -232,21 +273,26 @@ class NewController(Node):
         self.init_gripper()
         
         self.init_breather()
+        self.use_helmet = True
         
         self.vel_comm_ind = 0
         
         self.prev_velocities = np.zeros(6)
-        self.prev_accelerations = np.zeros(6)
         
         self.home_pos = np.array([-0.8, -1.73, -2.1,  0.73,  1.52,  3.16])
         self.gripper_length = 0.17
+        
+        self.traj_publisher = self.create_publisher(MarkerArray, "trajectory", 10)
+        
+        self.state = RobotState.START
+        self.speed = 0.05
                                         
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('present time.')  
     
     def get_gaze_velocities(self, breathing_velocities):
         
-        tf_name = "eye"
+        tf_name = "eye" if self.use_helmet else "exp/head"
                     
         gaze_multiplier = 3
         
@@ -299,17 +345,17 @@ class NewController(Node):
         print("Starting breathe and gaze.") 
         
         self.gripper.close_async()
+                            
+        self.breathe_controller.reset()   
         
-        self.gazing_breathing_compensation = False
-        self.use_helmet = False
-                    
-        self.breathe_controller.reset()    
+        if do_gazing:
+            print("gaze target at: ", self.tfBuffer.lookup_transform("world", "eye", rclpy.time.Time()).transform.translation) 
             
-        while rclpy.ok():              
-            
+        while rclpy.ok():      
+                        
             breathing_velocities = np.zeros(self.num_of_breathing_joints)
             if do_breathing:
-                breathing_velocities, mag = self.breathe_controller.step(self.joint_states_global["pos"], self.joint_states_global["vels"], get_jacobian)
+                breathing_velocities = self.breathe_controller.step(self.joint_states_global["pos"], self.joint_states_global["vels"], get_jacobian)
             
             gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
             if do_gazing:                
@@ -325,63 +371,48 @@ class NewController(Node):
         print("Exiting breathe and gaze.")
             
         self.stop_movement() 
-     
-    def follow_trajectory_in_base(self, trajectory, speed=0.05):
-        
-        if len(trajectory) == 0:
-            self.stop_movement()
-            print("Empty trajectory.")
-            return
-        
-        current_pos = np.zeros(3)        
-        transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
-        current_pos[0] = transformation.transform.translation.x
-        current_pos[1] = transformation.transform.translation.y
-        current_pos[2] = transformation.transform.translation.z 
-        
-        max_error = 0.0005
-        
-        amount_points = len(trajectory)
-        
-        pos_index = 1
-        
-        self.go_to_point(trajectory[0], speed)
-        
-        print("Following trajectory with", len(trajectory), "points.")
-                    
-        while rclpy.ok() and pos_index < amount_points:
 
+    def get_current_coordinate(self):
+        current_coordinate = np.zeros(3)
+        
+        try:
+            current_coordinate = get_ee_position(self.joint_states_global["pos"])
+        except:
+            print("Error in getting current coordinate.")
+        return current_coordinate
+        
+        
+        """current_coordinate = np.zeros(3)
+        try:
             transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
-            current_pos[0] = transformation.transform.translation.x
-            current_pos[1] = transformation.transform.translation.y
-            current_pos[2] = transformation.transform.translation.z 
-            
-            if np.linalg.norm(current_pos - trajectory[pos_index]) < max_error:
-                pos_index -= 1
-            
-            trajectory_desired_pos = trajectory[pos_index+1] - current_pos
-            trajectory_desired_full = np.concatenate((trajectory_desired_pos, np.zeros(3))) # May need to change from zeros to actual values while creating sphere
-            velocity_desired = trajectory_desired_full / np.linalg.norm(trajectory_desired_full) * speed
-            pinv_jacobian = self.get_inverse_jacobian()                
-            velocity_command = pinv_jacobian @ velocity_desired                    
-            self.publishVelocityCommand(velocity_command)
-             
-            pos_index += 1            
-            self.ros_rate.sleep()  
-                                    
-        self.stop_movement()        
-        print("Trajectory followed, current position: ", current_pos)
+            current_coordinate[0] = transformation.transform.translation.x
+            current_coordinate[1] = transformation.transform.translation.y
+            current_coordinate[2] = transformation.transform.translation.z 
+        except:
+            print("Error in getting current coordinate.")
+        return current_coordinate"""
 
-    def go_to_pose_in_base(self, desired_coordinate, desired_orientation, speed=0.05):       
-        # currently pose is a name in the tf_tree
+    def get_current_orientation(self):
+        current_orientation = np.zeros(3)
+        try:
+            transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
+            rotvec = R.from_quat([transformation.transform.rotation.x,
+                                    transformation.transform.rotation.y,
+                                    transformation.transform.rotation.z,
+                                    transformation.transform.rotation.w]).as_rotvec()
+            current_orientation = rotvec / np.linalg.norm(rotvec)
+        except:
+            print("Error in getting current orientation.")
+        return current_orientation
+
+    def go_to_pose_in_base(self, desired_coordinate, desired_orientation=None, speed=0.05):       
         
-        current_coordinate = np.zeros(3)        
-        transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
-        current_coordinate[0] = transformation.transform.translation.x
-        current_coordinate[1] = transformation.transform.translation.y
-        current_coordinate[2] = transformation.transform.translation.z 
+        current_coordinate = self.get_current_coordinate()
         
         max_error = 0.001
+        
+        dist = np.linalg.norm(desired_coordinate - current_coordinate)
+        slowdown_dist = dist*0.2
         
         if np.linalg.norm(desired_coordinate - current_coordinate) < max_error:
             self.stop_movement()
@@ -393,31 +424,34 @@ class NewController(Node):
         
         est_time = np.linalg.norm(desired_coordinate - current_coordinate) / speed
         
-        eef_to_desired = self.tfBuffer.lookup_transform(self.eef, desired_orientation, rclpy.time.Time())
-        rotvec = R.from_quat([eef_to_desired.transform.rotation.x,
-                                eef_to_desired.transform.rotation.y,
-                                eef_to_desired.transform.rotation.z,
-                                eef_to_desired.transform.rotation.w]).as_rotvec()
-        rot_speed = np.linalg.norm(rotvec)/est_time
-        
-        desired_rot_speed = (rotvec / np.linalg.norm(rotvec)) * rot_speed
-        pick_to_base = self.tfBuffer.lookup_transform(self.base, desired_orientation, rclpy.time.Time())
-        desired_rot_speed_in_base = R.from_quat([pick_to_base.transform.rotation.x,
-                                                    pick_to_base.transform.rotation.y,
-                                                    pick_to_base.transform.rotation.z,
-                                                    pick_to_base.transform.rotation.w]).apply(desired_rot_speed)
-        
-        print("Desired Rot Speed: ", desired_rot_speed_in_base)
+        if desired_orientation is not None:
+            rot_speed = np.linalg.norm(desired_orientation)/est_time            
+            desired_rot_speed_in_base = (desired_orientation / np.linalg.norm(desired_orientation)) * rot_speed 
+            desired_orientation = desired_orientation / np.linalg.norm(desired_orientation)          
+            print("Desired Rot Speed: ", desired_rot_speed_in_base)
+        else:
+            print("No desired orientation, keeping current orientation.")
+            desired_rot_speed_in_base = np.zeros(3)
+                    
+        start_time = time.time()                
+        min_speed = 0.05
+        min_dist = 0.1
+        curr_speed = speed if dist > min_dist else 0.1
+        error = 99999
                                     
-        while rclpy.ok() and np.linalg.norm(desired_coordinate - current_coordinate) > max_error:
-
-            transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
-            current_coordinate[0] = transformation.transform.translation.x
-            current_coordinate[1] = transformation.transform.translation.y
-            current_coordinate[2] = transformation.transform.translation.z 
+        while rclpy.ok() and error > max_error:
+                        
+            if time.time() - start_time > est_time:
+                desired_rot_speed_in_base = np.zeros(3)
+            
+            current_coordinate = self.get_current_coordinate()
+            
+            if dist > min_dist and curr_speed > min_speed and error < slowdown_dist:
+                curr_speed -= 0.0001
+                print("Slowing down, current speed: ", curr_speed, "-", len(data))
             
             trajectory_desired_coordinate = desired_coordinate - current_coordinate
-            velocity_desired_coordinate = trajectory_desired_coordinate / np.linalg.norm(trajectory_desired_coordinate) * speed 
+            velocity_desired_coordinate = trajectory_desired_coordinate / np.linalg.norm(trajectory_desired_coordinate) * curr_speed 
             
             velocity_desired = np.concatenate((velocity_desired_coordinate, desired_rot_speed_in_base)) # May need to change from zeros to actual values while creating sphere
             pinv_jacobian = self.get_inverse_jacobian()
@@ -426,59 +460,32 @@ class NewController(Node):
             self.publishVelocityCommand(velocity_command) 
             
             self.ros_rate.sleep()  
+            current_coordinate = self.get_current_coordinate()
+            tmp_error = np.linalg.norm(desired_coordinate - current_coordinate)
+            if tmp_error < slowdown_dist and tmp_error - error > 0.0001:
+                print("Error in position, breaking.", np.linalg.norm(desired_coordinate - current_coordinate), "-", error)
+                break
+            error = np.linalg.norm(desired_coordinate - current_coordinate)
                         
         self.stop_movement()        
         print("Position reached, current position: ", current_coordinate)
 
-    def go_to_point_in_base(self, desired_coordinate, speed=0.05):
+    def follow_trajectory_in_base(self, trajectory, speed=0.05):
         
-        current_coordinate = np.zeros(3)        
-        transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
-        current_coordinate[0] = transformation.transform.translation.x
-        current_coordinate[1] = transformation.transform.translation.y
-        current_coordinate[2] = transformation.transform.translation.z 
+        print("Following trajectory with", len(trajectory), "points.")
         
-        max_error = 0.001
-        
-        if np.linalg.norm(desired_coordinate - current_coordinate) < max_error:
+        if len(trajectory) == 0:
             self.stop_movement()
-            print("Already at the desired position.")
+            print("Empty trajectory.")
             return
-                                 
-        print("Current position: ", current_coordinate)   
-        print("Going to point: ", desired_coordinate)
-                                    
-        while rclpy.ok() and np.linalg.norm(desired_coordinate - current_coordinate) > max_error:
-
-            transformation = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
-            current_coordinate[0] = transformation.transform.translation.x
-            current_coordinate[1] = transformation.transform.translation.y
-            current_coordinate[2] = transformation.transform.translation.z 
-            
-            trajectory_desired_coordinate = desired_coordinate - current_coordinate
-            trajectory_desired_full = np.concatenate((trajectory_desired_coordinate, np.zeros(3))) # May need to change from zeros to actual values while creating sphere
-            velocity_desired = trajectory_desired_full / np.linalg.norm(trajectory_desired_full) * speed
-            pinv_jacobian = self.get_inverse_jacobian()
-            velocity_command = pinv_jacobian @ velocity_desired                  
-            self.publishVelocityCommand(velocity_command) 
-            
-            self.ros_rate.sleep()  
-                        
-        self.stop_movement()        
-        print("Position reached, current position: ", current_coordinate)
-     
-    def go_to_point_in_world(self, desired_coordinate, speed=0.05):
         
-        world_to_base = self.tfBuffer.lookup_transform(self.base, self.world, rclpy.time.Time())
-        world_to_base_point = R.from_quat([world_to_base.transform.rotation.x,
-                                            world_to_base.transform.rotation.y,
-                                            world_to_base.transform.rotation.z,
-                                            world_to_base.transform.rotation.w]).apply(desired_coordinate)
-        world_to_base_point[0] += world_to_base.transform.translation.x
-        world_to_base_point[1] += world_to_base.transform.translation.y
-        world_to_base_point[2] += world_to_base.transform.translation.z
-        
-        self.go_to_point_in_base(world_to_base_point, speed)
+        for point in trajectory:
+            print("Point: ", point)
+            self.go_to_pose_in_base(point[0], point[1], speed)
+            if len(point) > 2 and point[2] == "close":
+                self.gripper.close()
+            elif len(point) > 2 and point[2] == "open":
+                self.gripper.open()
         
     def go_to_joint_pos(self, desired_joint_positions, speed=0.05):
         
@@ -494,13 +501,14 @@ class NewController(Node):
         
         start_time = time.time()
         
-        while norm > 0.001 and time.time() - start_time < delta_t + 0.1:
+        while norm > 0.0005 and time.time() - start_time < delta_t + 0.1:
             norm = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])
             
         self.stop_movement() 
         
         print("Position reached, current position: ", self.joint_states_global["pos"])  
        
+    # there is no reason to use this instead of cubic, but I will keep it just in case
     def pick_up_object(self, object_name, speed=0.05):
         
         print("Picking up object: ", object_name)
@@ -508,23 +516,371 @@ class NewController(Node):
         try:
             object_tf = self.tfBuffer.lookup_transform(self.base, object_name, rclpy.time.Time())
             object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
-        except TransformException as e:
-            print("Error in getting object position: ", e)
+        
+            while object_position[2] > 0.5:
+                self.init_tf()
+                object_tf = self.tfBuffer.lookup_transform(self.base, object_name, rclpy.time.Time())
+                object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
+        
+            object_position[2] += self.gripper_length + 0.02        
+            object_position[0] -= 0.01
+            object_position[1] -= 0.01
+            self.gripper.open_async()
+            
+            eef_to_desired = self.tfBuffer.lookup_transform(self.eef, "pick_pose", rclpy.time.Time())
+            rotvec = R.from_quat([eef_to_desired.transform.rotation.x,
+                                    eef_to_desired.transform.rotation.y,
+                                    eef_to_desired.transform.rotation.z,
+                                    eef_to_desired.transform.rotation.w]).as_rotvec()
+            
+            pick_to_base = self.tfBuffer.lookup_transform(self.base, "pick_pose", rclpy.time.Time())
+            rotvec = R.from_quat([pick_to_base.transform.rotation.x,
+                                                        pick_to_base.transform.rotation.y,
+                                                        pick_to_base.transform.rotation.z,
+                                                        pick_to_base.transform.rotation.w]).apply(rotvec)
+            
+            trajectory = []
+            trajectory.append((object_position,rotvec))
+            trajectory.append((object_position - np.array([0, 0, 0.05]),None,"close"))
+            trajectory.append((object_position,None))
+            
+            self.follow_trajectory_in_base(trajectory, speed)
+        except Exception as e:
+            print("Error in picking up object: ", e)
             return
+   
+    def follow_derivative(self, x_derivative, y_derivative, z_derivative, trajectory_length, desired_orientation, speed):
+                            
+        est_time = trajectory_length / speed
+        if desired_orientation is not None:
+            rot_speed = np.linalg.norm(desired_orientation)/(est_time)           
+            desired_rot_speed = (desired_orientation / np.linalg.norm(desired_orientation)) * rot_speed 
+            print("Desired Rot Speed: ", desired_rot_speed)
+        else:
+            print("No desired orientation, keeping current orientation.")
+            desired_rot_speed = np.zeros(3)
+                
+        t = 0
+        speed_multiplier = 1
         
-        object_position[2] += self.gripper_length + 0.02
+        while rclpy.ok() and t <= 1:
+            
+            if t < 0.25:
+                speed_multiplier = 0.2 + 0.8*(t*4)
+            elif t > 0.75:
+                speed_multiplier = 0.2 + 0.8*((1-t)*4)
+            else:
+                speed_multiplier = 1
+                                            
+            trajectory_desired = np.array([x_derivative(t), y_derivative(t), z_derivative(t)])
+            desired_linear_speed = (trajectory_desired / np.linalg.norm(trajectory_desired)) * speed
+            desired_speed = np.concatenate((desired_linear_speed, desired_rot_speed))
+            desired_speed *= speed_multiplier
+            
+            pinv_jacobian = self.get_inverse_jacobian()
+            velocity_command = pinv_jacobian @ desired_speed
+            self.publishVelocityCommand(velocity_command)
+            
+            self.ros_rate.sleep()
+            t += (speed * speed_multiplier) / (trajectory_length * self.control_rate)            
+                            
+        self.stop_movement()
+    
+    def set_pick_up_cubic_variables(self, object_name):
+        print("Setting up cubic pick up variables.")
         
-        object_position[0] -= 0.01
-        object_position[1] -= 0.01
-        self.gripper.open_async()
+        try:
+            object_tf = self.tfBuffer.lookup_transform(self.base, object_name, rclpy.time.Time())
+            object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
         
-        self.go_to_pose_in_base(object_position, "pick_pose", speed)
+            while object_position[2] > 0.5:
+                self.init_tf()
+                object_tf = self.tfBuffer.lookup_transform(self.base, object_name, rclpy.time.Time())
+                object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
         
-        self.go_to_point_in_base(object_position - np.array([0, 0, 0.05]), speed)
+            object_position[2] += self.gripper_length + 0.02        
+            object_position[0] -= 0.01
+            object_position[1] -= 0.01
+            self.gripper.open_async()
+            
+            eef_to_desired = self.tfBuffer.lookup_transform(self.eef, "pick_pose", rclpy.time.Time())
+            rotvec = R.from_quat([eef_to_desired.transform.rotation.x,
+                                    eef_to_desired.transform.rotation.y,
+                                    eef_to_desired.transform.rotation.z,
+                                    eef_to_desired.transform.rotation.w]).as_rotvec()
+            
+            pick_to_base = self.tfBuffer.lookup_transform(self.base, "pick_pose", rclpy.time.Time())
+            rotvec = R.from_quat([pick_to_base.transform.rotation.x,
+                                                        pick_to_base.transform.rotation.y,
+                                                        pick_to_base.transform.rotation.z,
+                                                        pick_to_base.transform.rotation.w]).apply(rotvec)
+                                    
+            start_point = self.get_current_coordinate()
+            mid_point = object_position
+            end_point = object_position - np.array([0, 0, 0.05])
+            x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_point, mid_point, end_point)
+       
+            x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+            y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+            z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+            
+            length_local = 0
+            prev_point = np.array([x_coordinate(0), y_coordinate(0), z_coordinate(0)])
+            i = 0
+            while i < 1000:
+                point = np.array([x_coordinate(i/1000), y_coordinate(i/1000), z_coordinate(i/1000)])
+                length_local += np.linalg.norm(point - prev_point)
+                prev_point = point      
+                i += 1          
+                        
+            est_time = length_local / self.speed
+            if rotvec is not None:
+                rot_speed = np.linalg.norm(rotvec)/(est_time)           
+                desired_rot_speed_local = (rotvec / np.linalg.norm(rotvec)) * rot_speed 
+                print("Desired Rot Speed: ", desired_rot_speed_local)
+            else:
+                print("No desired orientation, keeping current orientation.")
+                desired_rot_speed_local = np.zeros(3)
+                         
+            self.desired_rot_speed = desired_rot_speed_local
+                                    
+            self.length = length_local
+            
+            self.x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+            self.y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+            self.z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+                            
+            self.t = 0
+            
+            self.speed_multiplier = 1
+                
+        except Exception as e:
+            print("Error in setting pick up object cubically:", e)
+            return
+    
+    def set_place_cubic_variables(self):
         
-        self.gripper.close()
+        try:
+                        
+            start_point = self.get_current_coordinate()
+            end_point = start_point + np.array([-0.8, -0.5, 0])
+            mid_point = (start_point + end_point)/2 + np.array([0, 0, 0.5])
+            x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_point, mid_point, end_point)                         
+            
+            x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+            y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+            z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+            
+            length_local = 0
+            prev_point = np.array([x_coordinate(0), y_coordinate(0), z_coordinate(0)])
+            i = 0
+            while i < 1000:
+                point = np.array([x_coordinate(i/1000), y_coordinate(i/1000), z_coordinate(i/1000)])
+                length_local += np.linalg.norm(point - prev_point)
+                prev_point = point  
+                i += 1              
+            
+            self.desired_rot_speed = np.zeros(3)
+                                    
+            self.length = length_local
+            
+            self.x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+            self.y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+            self.z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+                            
+            self.t = 0
+            
+            self.speed_multiplier = 1
+                
+        except Exception as e:
+            print("Error in picking up object cubically:", e)
+            return
+    
+    def set_breathing_gazing(self):
         
-        self.go_to_point_in_base(object_position, speed)
+        self.go_to_home_pos(self.speed) 
+        self.gripper.close_async()                          
+        self.breathe_controller.reset()
+    
+    def get_derivative_velocities(self):
+                    
+        if self.t < 0.25:
+            self.speed_multiplier = 0.2 + 0.8*(self.t*4)
+        elif self.t > 0.75:
+            self.speed_multiplier = 0.2 + 0.8*((1-self.t)*4)
+        else:
+            self.speed_multiplier = 1
+                                        
+        trajectory_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        desired_linear_speed = (trajectory_desired / np.linalg.norm(trajectory_desired)) * self.speed
+        desired_speed = np.concatenate((desired_linear_speed, self.desired_rot_speed))
+        desired_speed *= self.speed_multiplier
+        
+        pinv_jacobian = self.get_inverse_jacobian()
+        velocity_command = pinv_jacobian @ desired_speed
+        
+        self.t += (self.speed * self.speed_multiplier) / (self.length * self.control_rate)            
+        
+        return velocity_command
+                                 
+    def pick_up_object_cubic(self, object_name, speed=0.05):
+        print("Picking up object cubically: ", object_name)
+        
+        try:
+            object_tf = self.tfBuffer.lookup_transform(self.base, object_name, rclpy.time.Time())
+            object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
+        
+            while object_position[2] > 0.5:
+                self.init_tf()
+                object_tf = self.tfBuffer.lookup_transform(self.base, object_name, rclpy.time.Time())
+                object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
+        
+            object_position[2] += self.gripper_length + 0.02        
+            object_position[0] -= 0.01
+            object_position[1] -= 0.01
+            self.gripper.open_async()
+            
+            eef_to_desired = self.tfBuffer.lookup_transform(self.eef, "pick_pose", rclpy.time.Time())
+            rotvec = R.from_quat([eef_to_desired.transform.rotation.x,
+                                    eef_to_desired.transform.rotation.y,
+                                    eef_to_desired.transform.rotation.z,
+                                    eef_to_desired.transform.rotation.w]).as_rotvec()
+            
+            pick_to_base = self.tfBuffer.lookup_transform(self.base, "pick_pose", rclpy.time.Time())
+            rotvec = R.from_quat([pick_to_base.transform.rotation.x,
+                                                        pick_to_base.transform.rotation.y,
+                                                        pick_to_base.transform.rotation.z,
+                                                        pick_to_base.transform.rotation.w]).apply(rotvec)
+                        
+            start_point = self.get_current_coordinate()
+            mid_point = object_position
+            end_point = object_position - np.array([0, 0, 0.05])
+            x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_point, mid_point, end_point)                         
+            
+            x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+            y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+            z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+            
+            x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+            y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+            z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+            
+            length = 0
+            prev_point = np.array([x_coordinate(0), y_coordinate(0), z_coordinate(0)])
+            for i in range(1000):
+                point = np.array([x_coordinate(i/1000), y_coordinate(i/1000), z_coordinate(i/1000)])
+                length += np.linalg.norm(point - prev_point)
+                prev_point = point                
+            
+            """traj_points = MarkerArray()
+            id = 0
+            print("Generating trajectory points.")
+            points = np.linspace(0, 1, num=100) # for visualization
+            for pt in points:
+                
+                marker = Marker()
+                marker.header.frame_id = self.base
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "trajectory"
+                marker.id = id
+                marker.type = marker.SPHERE
+                marker.action = marker.ADD
+                marker.pose.position.x = x_coordinate(pt)
+                marker.pose.position.y = y_coordinate(pt)
+                marker.pose.position.z = z_coordinate(pt)
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
+                marker.scale.x = 0.01
+                marker.scale.y = 0.01
+                marker.scale.z = 0.01
+                marker.color.r = 1.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                marker.color.a = 1.0
+                                
+                traj_points.markers.append(marker)
+                
+                id += 1
+            print("Trajectory points: ", len(traj_points.markers))
+            self.traj_publisher.publish(traj_points)    
+            print("Trajectory published.")"""   
+            
+            self.follow_derivative(x_derivative, y_derivative, z_derivative, length, rotvec, speed)
+            
+            self.gripper.close()
+                
+        except Exception as e:
+            print("Error in picking up object cubically:", e)
+            return
+    
+    def place_object_cubic(self, speed=0.05):
+        
+        try:
+                        
+            start_point = self.get_current_coordinate()
+            end_point = start_point + np.array([-0.8, -0.5, 0])
+            mid_point = (start_point + end_point)/2 + np.array([0, 0, 0.5])
+            x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_point, mid_point, end_point)                         
+            
+            x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+            y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+            z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+            
+            x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+            y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+            z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+            
+            length = 0
+            prev_point = np.array([x_coordinate(0), y_coordinate(0), z_coordinate(0)])
+            for i in range(1000):
+                point = np.array([x_coordinate(i/1000), y_coordinate(i/1000), z_coordinate(i/1000)])
+                length += np.linalg.norm(point - prev_point)
+                prev_point = point                
+            
+            """traj_points = MarkerArray()
+            id = 0
+            print("Generating trajectory points.")
+            points = np.linspace(0, 1, num=100) # for visualization
+            for pt in points:
+                
+                marker = Marker()
+                marker.header.frame_id = self.base
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "trajectory"
+                marker.id = id
+                marker.type = marker.SPHERE
+                marker.action = marker.ADD
+                marker.pose.position.x = x_coordinate(pt)
+                marker.pose.position.y = y_coordinate(pt)
+                marker.pose.position.z = z_coordinate(pt)
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
+                marker.scale.x = 0.01
+                marker.scale.y = 0.01
+                marker.scale.z = 0.01
+                marker.color.r = 1.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                marker.color.a = 1.0
+                                
+                traj_points.markers.append(marker)
+                
+                id += 1
+            print("Trajectory points: ", len(traj_points.markers))
+            self.traj_publisher.publish(traj_points)    
+            print("Trajectory published.")"""   
+            
+            self.follow_derivative(x_derivative, y_derivative, z_derivative, length, None, speed)
+            
+            self.gripper.open()
+                
+        except Exception as e:
+            print("Error in picking up object cubically:", e)
+            return
     
     def go_to_home_pos(self, speed=0.05):
         self.go_to_joint_pos(self.home_pos, speed=speed)
@@ -533,6 +889,7 @@ class NewController(Node):
         vel_msg = Float64MultiArray()
         vel_msg.data = np.array([0, 0, 0, 0, 0, 0])
         self.velocityControllerPub.publish(vel_msg)
+        self.vel_comm_ind = 0
         print("Movement stopped.")
           
     def get_jacobian_matrix(self):
@@ -552,26 +909,21 @@ class NewController(Node):
             self.prev_velocities = joint_velocities
             self.vel_comm_ind = 1
             return joint_velocities
-        elif self.vel_comm_ind == 1:
-            self.prev_accelerations = (joint_velocities - self.prev_velocities) * self.control_rate
-            self.prev_velocities = joint_velocities
-            self.vel_comm_ind = 2
-            return joint_velocities
+                
+        max_speed_diffs = np.array([0.004, 0.004, 0.004, 0.004, 0.004, 0.004])
+        critical_speed_diffs = np.array([0.007, 0.007, 0.007, 0.007, 0.007, 0.007])
         
-        curr_accelerations = (joint_velocities - self.prev_velocities) * self.control_rate
-        
-        max_acceleration_diffs = np.array([99, 99, 99, 2, 2, 2])
-        
-        filter_weight = 0.7
-        
-        for i in range(self.num_of_total_joints):
-            if abs(curr_accelerations[i] - self.prev_accelerations[i]) > max_acceleration_diffs[i]:
-                joint_velocities[i] = self.prev_velocities[i]*filter_weight + joint_velocities[i]*(1-filter_weight)
-                #joint_velocities[i] = self.prev_velocities[i] + (np.sign(curr_accelerations[i] - self.prev_accelerations[i]) * max_acceleration_diffs[i] / self.control_rate)
-                self.prev_accelerations[i] = (joint_velocities[i] - self.prev_velocities[i]) * self.control_rate
+        filter_weight = 0.8
+                
+        for j in range(self.num_of_total_joints):
+            change = joint_velocities[j] - self.prev_velocities[j]
+            if abs(change) > max_speed_diffs[j]:
+                joint_velocities[j] = self.prev_velocities[j]*filter_weight + joint_velocities[j]*(1-filter_weight)
+                #joint_velocities[j] = self.prev_velocities[j] + np.sign(change) * max_speed_diffs[j]
+                if abs(joint_velocities[j] - self.prev_velocities[j]) > critical_speed_diffs[j]:
+                    joint_velocities[j] = self.prev_velocities[j] + np.sign(change) * critical_speed_diffs[j] 
         
         self.prev_velocities = joint_velocities
-        self.prev_accelerations = curr_accelerations
         
         return joint_velocities
     
@@ -579,7 +931,10 @@ class NewController(Node):
         if type(vels) is not np.ndarray:
             vels = np.array(vels)
          
-        vels = self.filter_joint_velocities(vels)            
+        vels = self.filter_joint_velocities(vels)      
+        
+        data.append(self.joint_states_global["vels"])
+        data_c.append(vels)
             
         vel_msg = Float64MultiArray()
         vel_msg.data = vels
@@ -608,7 +963,119 @@ class NewController(Node):
                                             msg.effort[2],
                                             msg.effort[3],
                                             msg.effort[4]])         
-   
+
+    def raise_eef(self, raise_amount, speed=0.1):
+                
+        t = 0
+        speed_multiplier = 1
+        
+        trajectory_desired = np.array([0,0,1*np.sign(raise_amount)])
+        raise_amount = abs(raise_amount)
+        
+        while rclpy.ok() and t <= 1:
+            
+            if t < 0.25:
+                speed_multiplier = 0.2 + 0.8*(t*4)
+            elif t > 0.75:
+                speed_multiplier = 0.2 + 0.8*((1-t)*4)
+            else:
+                speed_multiplier = 1
+                                            
+            desired_linear_speed = (trajectory_desired / np.linalg.norm(trajectory_desired)) * speed
+            desired_speed = np.concatenate((desired_linear_speed, np.zeros(3)))
+            desired_speed *= speed_multiplier
+            
+            pinv_jacobian = self.get_inverse_jacobian()
+            velocity_command = pinv_jacobian @ desired_speed
+            self.publishVelocityCommand(velocity_command)
+            
+            self.ros_rate.sleep()
+            t += (speed * speed_multiplier) / (raise_amount * self.control_rate)            
+                            
+        self.stop_movement()
+        
+    def state_machine(self):
+        
+        # Set flags for breathing and gazing
+        do_breathing = True
+        do_gazing = True
+        
+        inf_breathe = False
+        
+        start_time = time.time()
+        
+        while rclpy.ok():
+            
+            if self.state == RobotState.START:
+                
+                self.go_to_home_pos(speed=self.speed)
+                self.set_breathing_gazing()
+                self.state = RobotState.BREATHING_GAZING
+                start_time = time.time()
+                continue
+                
+            elif self.state == RobotState.BREATHING_GAZING:
+                
+                breathing_velocities = np.zeros(self.num_of_breathing_joints)
+                if do_breathing:
+                    breathing_velocities = self.breathe_controller.step(self.joint_states_global["pos"], self.joint_states_global["vels"], get_jacobian)
+                
+                gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+                if do_gazing:                
+                    gazing_velocities = self.get_gaze_velocities(breathing_velocities)                
+                        
+                velocity_command = np.concatenate((breathing_velocities, gazing_velocities))
+                
+                if not inf_breathe and time.time() - start_time > 10:
+                    self.state = RobotState.PICKING
+                    self.set_pick_up_cubic_variables("marker_11")
+                    continue
+                
+            elif self.state == RobotState.PICKING:
+                
+                if self.t >= 0 and self.t <= 1:
+                    velocity_command = self.get_derivative_velocities()
+                elif self.t < 0:
+                    print("SOMETHING WENT EXTREMELY WRONG.")
+                    self.stop_movement()
+                    self.state = RobotState.END
+                    continue
+                else:
+                    self.stop_movement()
+                    self.state = RobotState.PLACING
+                    self.set_place_cubic_variables()
+                    self.gripper.close()
+                    continue
+                
+            elif self.state == RobotState.PLACING:
+                
+                if self.t >= 0 and self.t <= 1:
+                    velocity_command = self.get_derivative_velocities()
+                elif self.t < 0:
+                    print("SOMETHING WENT EXTREMELY WRONG.")
+                    self.stop_movement()
+                    self.state = RobotState.END
+                    continue
+                else:
+                    self.stop_movement()
+                    self.gripper.open()
+                    self.set_breathing_gazing()
+                    self.state = RobotState.BREATHING_GAZING
+                    inf_breathe = True
+                    continue
+                
+            elif self.state == RobotState.END:
+                
+                self.stop_movement()
+                break
+                
+            self.publishVelocityCommand(velocity_command)
+                
+            self.ros_rate.sleep()
+            
+        self.stop_movement()
+        self.go_to_home_pos(speed=self.speed)
+
     def deneme(self):
         
         while rclpy.ok():
@@ -639,7 +1106,7 @@ def spin_thread(node):
     
     try:
         rclpy.spin(node)
-    except:
+    except Exception as e:
         node.stop_movement()
         pass
         
@@ -654,12 +1121,11 @@ def main(args=None):
         
         print("Starting main.")
         
-        #new_controller.go_to_home_pos(speed=0.1)
-        #new_controller.breathe_and_gaze()
+        new_controller.speed = 0.3
+        new_controller.state_machine()
         
-        new_controller.pick_up_object("marker_11")
-    except:    
-        print("Error in main.")   
+    except Exception as e:    
+        print("Error in main: ", e)   
         pass
     
     try:
@@ -673,4 +1139,36 @@ def main(args=None):
     controller_spin_thread.join()
     
     print("\n take care of yourself \n")
+    
+    j1 = [x for x in np.array(data)[:,0]]
+    j2 = [x for x in np.array(data)[:,1]]
+    j3 = [x for x in np.array(data)[:,2]]
+    j4 = [x for x in np.array(data)[:,3]]
+    j5 = [x for x in np.array(data)[:,4]]
+    j6 = [x for x in np.array(data)[:,5]]
+    
+    plt.plot(j1, label="Joint 1")
+    plt.plot(j2, label="Joint 2")
+    plt.plot(j3, label="Joint 3")
+    plt.plot(j4, label="Joint 4")
+    plt.plot(j5, label="Joint 5")
+    plt.plot(j6, label="Joint 6")
+    plt.legend()
+    plt.show()
+    
+    j1 = [x for x in np.array(data_c)[:,0]]
+    j2 = [x for x in np.array(data_c)[:,1]]
+    j3 = [x for x in np.array(data_c)[:,2]]
+    j4 = [x for x in np.array(data_c)[:,3]]
+    j5 = [x for x in np.array(data_c)[:,4]]
+    j6 = [x for x in np.array(data_c)[:,5]]
+    
+    plt.plot(j1, label="Joint 1")
+    plt.plot(j2, label="Joint 2")
+    plt.plot(j3, label="Joint 3")
+    plt.plot(j4, label="Joint 4")
+    plt.plot(j5, label="Joint 5")
+    plt.plot(j6, label="Joint 6")
+    plt.legend()
+    plt.show()
     
